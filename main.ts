@@ -61,6 +61,17 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
+  /** The path exists as the edits leave it, counting a directory on disk as existing (SPEC.md section 2: a create or a move to a path that exists fails). */
+  exists(p: string): boolean {
+    if (this.now.has(p)) return this.now.get(p) !== null;
+    if (this.original(p) !== null) return true;
+    try {
+      statSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 type Edit = (tree: Tree) => void;
@@ -195,7 +206,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.exists(p)) throw new Fail('exists', p);
       tree.now.set(p, text);
     };
   }
@@ -297,7 +308,7 @@ function applyHunks(f: FileState, hunks: Hunk[], strict: boolean, errPath: strin
       const pos = Math.max(0, Math.min(h.a + d, f.lines.length));
       const atEnd = pos === f.lines.length;
       f.lines.splice(pos, 0, ...h.entries.map((e) => e.text));
-      if (atEnd) {
+      if (atEnd && h.entries.length > 0) {
         const lastNew = h.entries[h.entries.length - 1];
         f.finalBreak = !(lastNew !== undefined && lastNew.slash);
       }
@@ -326,7 +337,7 @@ function unifiedSectionEdit(sec: UnifiedSection, strict: boolean): Edit {
     if (newP !== null && !safe(newP)) throw new Fail('unsafe', newP);
     if (isCreate) {
       const target = newP!;
-      if (tree.get(target) !== null) throw new Fail('exists', target);
+      if (tree.exists(target)) throw new Fail('exists', target);
       const plus: BodyEntry[] = [];
       for (const h of hunks) for (const e of h.entries) if (e.kind === 'new') plus.push(e);
       const last = plus[plus.length - 1];
@@ -338,7 +349,7 @@ function unifiedSectionEdit(sec: UnifiedSection, strict: boolean): Edit {
     } else if (isMove) {
       const before = tree.get(oldP!);
       if (before === null) throw new Fail('missing', oldP!);
-      if (tree.get(newP!) !== null) throw new Fail('exists', newP!);
+      if (tree.exists(newP!)) throw new Fail('exists', newP!);
       const f = parseFile(before);
       applyHunks(f, hunks, strict, oldP!);
       tree.now.set(newP!, serializeFile(f));
@@ -403,6 +414,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       const l = lines[i]!;
       if (l.startsWith('diff --git ')) break;
       if (l.startsWith('--- ')) {
+        if (sawPair && pairAt(i)) break;
         if (i + 1 >= n || !lines[i + 1]!.startsWith('+++ ')) throw new Exit2(`error: parse ${i + 2}`);
         oldPath = headerPath(l);
         newPath = headerPath(lines[i + 1]!);
@@ -499,7 +511,7 @@ function srEdit(path: string, oldLines: string[], newLines: string[], strict: bo
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
     if (oldLines.length === 0) {
-      if (tree.get(path) !== null) throw new Fail('exists', path);
+      if (tree.exists(path)) throw new Fail('exists', path);
       tree.now.set(path, serializeFile({ lines: [...newLines], br: '\n', finalBreak: true }));
       return;
     }
@@ -541,18 +553,22 @@ function srEdits(lines: string[], strict: boolean): Edit[] {
     if (path === null) throw new Exit2(`error: parse ${searchLine}`);
     let eq = -1;
     for (let j = i + 1; j < lines.length; j += 1) {
-      if (lines[j]!.trimEnd() === '=======') {
+      const t = lines[j]!.trimEnd();
+      if (t === '=======') {
         eq = j;
         break;
       }
+      if (t === '>>>>>>> REPLACE' || t === '<<<<<<< SEARCH') throw new Exit2(`error: parse ${searchLine}`);
     }
     if (eq < 0) throw new Exit2(`error: parse ${searchLine}`);
     let rep = -1;
     for (let j = eq + 1; j < lines.length; j += 1) {
-      if (lines[j]!.trimEnd() === '>>>>>>> REPLACE') {
+      const t = lines[j]!.trimEnd();
+      if (t === '>>>>>>> REPLACE') {
         rep = j;
         break;
       }
+      if (t === '<<<<<<< SEARCH') throw new Exit2(`error: parse ${searchLine}`);
     }
     if (rep < 0) throw new Exit2(`error: parse ${searchLine}`);
     edits.push(srEdit(path, lines.slice(i + 1, eq), lines.slice(eq + 1, rep), strict));
@@ -576,7 +592,7 @@ function v4aUpdateEdit(path: string, moveTo: string | null, chunks: V4aChunk[], 
     if (moveTo !== null && !safe(moveTo)) throw new Fail('unsafe', moveTo);
     const before = tree.get(path);
     if (before === null) throw new Fail('missing', path);
-    if (moveTo !== null && tree.get(moveTo) !== null) throw new Fail('exists', moveTo);
+    if (moveTo !== null && tree.exists(moveTo)) throw new Fail('exists', moveTo);
     const f = parseFile(before);
     let cursor = 0;
     for (const chunk of chunks) {
@@ -657,7 +673,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       }
       edits.push((tree) => {
         if (!safe(path)) throw new Fail('unsafe', path);
-        if (tree.get(path) !== null) throw new Fail('exists', path);
+        if (tree.exists(path)) throw new Fail('exists', path);
         tree.now.set(path, serializeFile({ lines: fileLines, br: '\n', finalBreak: true }));
       });
     } else if (start.kind === 'delete') {
@@ -690,7 +706,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           const a = t.slice(2).trim();
           cur = { anchor: a === '' ? null : a, eof: false, entries: [] };
         } else if (t === '*** End of File') {
-          if (cur === null) cur = { anchor: null, eof: false, entries: [] };
+          if (cur === null) throw new Exit2(`error: parse ${r.n}`);
           cur.eof = true;
           closeChunk();
         } else if (t.startsWith('*** ')) {
